@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -265,14 +266,19 @@ class DownloadEngine:
         for attempt in range(MAX_RETRIES):
             try:
                 self._state_manager.increment_retry(file_state.filename)
-                self._fetch_to_disk(client, file_state, filepath)
+                inline_md5 = self._fetch_to_disk(client, file_state, filepath)
 
                 result = self._validator.validate(filepath, file_state.expected_size)
                 if result.valid:
                     # Size is good; now verify content against MD5SUMS (if available).
+                    # Reuse the digest computed while streaming when available, so
+                    # we don't re-read large files just to hash them.
                     expected_md5 = self._md5_map.get(file_state.filename)
                     md5_result = self._md5_validator.validate(
-                        filepath, file_state.expected_size, expected_md5=expected_md5
+                        filepath,
+                        file_state.expected_size,
+                        expected_md5=expected_md5,
+                        actual_md5=inline_md5,
                     )
                     if md5_result.valid:
                         md5_status = (
@@ -365,8 +371,14 @@ class DownloadEngine:
 
     def _fetch_to_disk(
         self, client: httpx.Client, file_state: FileState, filepath: Path
-    ):
+    ) -> str | None:
         """Fetch a single file to disk, choosing the download strategy.
+
+        Returns the file's MD5 hex digest if it was computed inline during a
+        single-stream download (letting the caller skip a re-read for
+        verification), or ``None`` when it can't be produced inline (parallel
+        segmented downloads write out of order; resumed downloads miss the
+        earlier bytes). Callers must fall back to hashing the file when None.
 
         Large files are downloaded as parallel byte-range segments *if the
         backend supports ranged GETs*; this is the big throughput win on
@@ -388,7 +400,8 @@ class DownloadEngine:
         if use_parallel:
             try:
                 self._parallel_ranged_download(client, url, filepath, filename, expected)
-                return
+                # Segments are written out of order, so no inline digest.
+                return None
             except _RangeUnsupported:
                 # A segment saw a non-206 mid-flight: the backend isn't honouring
                 # ranges after all. Fall back to a clean single-stream download.
@@ -397,7 +410,9 @@ class DownloadEngine:
                     filename,
                 )
 
-        self._stream_to_disk(client, url, filepath, filename, expected_size=expected)
+        return self._stream_to_disk(
+            client, url, filepath, filename, expected_size=expected
+        )
 
     def _supports_range(self, client: httpx.Client, url: str) -> bool:
         """Probe whether the backend serving ``url`` honours range requests.
@@ -505,7 +520,7 @@ class DownloadEngine:
         filepath: Path,
         filename: str,
         expected_size: int | None = None,
-    ):
+    ) -> str | None:
         """Stream ``url`` to ``filepath``, resuming from a partial file if one
         exists.
 
@@ -513,9 +528,15 @@ class DownloadEngine:
         append, so an interrupted download continues from where it stopped
         instead of restarting from zero. Resume is only kept if the server
         honours the range (responds ``206``); if it ignores the range and sends
-        the whole body (``200``), we transparently fall back to a clean full
+        the whole object (``200``), we transparently fall back to a clean full
         download (truncating first). A partial that is already >= the expected
         size is discarded and re-fetched, since it can't be trusted.
+
+        Returns the file's MD5 hex digest when it was computed inline (i.e. the
+        whole file streamed through in order, from scratch), so the caller can
+        skip a second full read for verification. Returns ``None`` when the
+        download resumed from a partial (the pre-existing bytes weren't hashed),
+        in which case the caller must hash the file itself if it needs the digest.
         """
         resume_from = 0
         if filepath.exists():
@@ -545,6 +566,11 @@ class DownloadEngine:
                 if progress is not None:
                     progress.bytes_downloaded = resume_from if resuming else 0
 
+            # Hash inline only for a full from-scratch stream. On a resume we
+            # didn't see the earlier bytes, so we can't produce a whole-file
+            # digest here and return None instead.
+            hasher = hashlib.md5() if not resuming else None
+
             with open(filepath, mode) as f:
                 if resuming:
                     f.seek(resume_from)
@@ -553,9 +579,13 @@ class DownloadEngine:
                     f.truncate(0)
                 for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
                     f.write(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
                     with self._lock:
                         progress = self._progress.get(filename)
                         if progress is not None:
                             progress.bytes_downloaded += len(chunk)
                     if self._progress_callback:
                         self._progress_callback(filename, "progress")
+
+            return hasher.hexdigest() if hasher is not None else None

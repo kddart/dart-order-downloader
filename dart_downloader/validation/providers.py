@@ -93,13 +93,22 @@ class Md5ValidationProvider(ValidationProvider):
         expected_size: int,
         *,
         expected_md5: str | None = None,
+        actual_md5: str | None = None,
         **kwargs,
     ) -> ValidationResult:
+        """Validate the file's MD5 against ``expected_md5``.
+
+        ``actual_md5`` may be supplied by the caller when the digest was already
+        computed while streaming the file to disk (see the engine's inline
+        hashing), avoiding a second full read of large genomic files. When it is
+        ``None`` the digest is computed here by reading the file.
+        """
         if not filepath.exists():
             return ValidationResult(False, "File does not exist")
         if expected_md5 is None:
             return ValidationResult(True, "No MD5 checksum available (not in MD5SUMS)")
-        actual_md5 = compute_md5(filepath)
+        if actual_md5 is None:
+            actual_md5 = compute_md5(filepath)
         if actual_md5 == expected_md5.lower():
             return ValidationResult(True, "MD5 verified")
         return ValidationResult(

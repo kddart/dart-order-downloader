@@ -1298,3 +1298,84 @@ class TestParallelRangedDownload:
 
         assert state["peak"] <= budget
         assert eng._get_filepath(sm.manifest.files[0]).read_bytes() == payload
+
+
+# --- Inline hashing during streaming (recommendation D) ---
+
+class TestInlineHashing:
+    def _md5_order(self, folder, payload, digest):
+        base = "https://ex.invalid/RawData"
+        md5sums = f"{digest}  a.gz\n".encode()
+        files = [
+            OrderFile(filename="MD5SUMS", filesizeinbyte=len(md5sums), filetype="RawData",
+                      fileurl=f"{base}/MD5SUMS", modifieddatetime="2026-01-01"),
+            OrderFile(filename="a.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/a.gz", modifieddatetime="2026-01-01"),
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        return sm, base, md5sums
+
+    def _seed_progress(self, eng, sm):
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+
+    def test_single_stream_reuses_inline_digest_no_reread(self, tmp_download_folder, monkeypatch):
+        payload = b"inline-hash-me" * 10
+        digest = hashlib.md5(payload).hexdigest()
+        sm, base, md5sums = self._md5_order(tmp_download_folder, payload, digest)
+
+        # Fail loudly if the file is re-read for hashing after download.
+        import dart_downloader.validation.providers as prov
+        calls = {"n": 0}
+        real = prov.compute_md5
+        monkeypatch.setattr(prov, "compute_md5",
+                            lambda p: (calls.__setitem__("n", calls["n"] + 1), real(p))[1])
+
+        eng = _make_engine(sm, tmp_download_folder)
+        self._seed_progress(eng, sm)
+        client = _FakeClient({f"{base}/MD5SUMS": md5sums, f"{base}/a.gz": payload},
+                             supports_range=True)
+        remaining = eng._prepare_md5sums(client, sm.get_pending_files())
+        for f in remaining:
+            eng._download_file(client, f)
+
+        a = next(f for f in sm.manifest.files if f.filename == "a.gz")
+        assert a.md5_status == Md5Status.VERIFIED
+        # compute_md5 was NOT called for a.gz — the inline digest was reused.
+        assert calls["n"] == 0
+
+    def test_inline_digest_still_catches_mismatch(self, tmp_download_folder, monkeypatch):
+        monkeypatch.setattr("dart_downloader.download.engine.time.sleep", lambda *_: None)
+        payload = b"actual-bytes"
+        wrong_digest = "0" * 32  # MD5SUMS claims a digest the content won't match
+        sm, base, md5sums = self._md5_order(tmp_download_folder, payload, wrong_digest)
+
+        eng = _make_engine(sm, tmp_download_folder)
+        self._seed_progress(eng, sm)
+        client = _FakeClient({f"{base}/MD5SUMS": md5sums, f"{base}/a.gz": payload},
+                             supports_range=True)
+        remaining = eng._prepare_md5sums(client, sm.get_pending_files())
+        for f in remaining:
+            eng._download_file(client, f)
+
+        a = next(f for f in sm.manifest.files if f.filename == "a.gz")
+        # Inline digest must still detect the mismatch and fail the file.
+        assert a.md5_status == Md5Status.MISMATCH
+        assert a.status == FileStatus.FAILED
+
+    def test_provider_accepts_precomputed_digest(self, tmp_download_folder):
+        # Unit-level: passing actual_md5 skips the file read entirely.
+        from dart_downloader.validation.providers import Md5ValidationProvider
+        p = tmp_download_folder / "x.gz"
+        p.write_bytes(b"whatever")
+        good = hashlib.md5(b"whatever").hexdigest()
+        # Provide a matching precomputed digest; file content is irrelevant here.
+        res = Md5ValidationProvider().validate(p, 8, expected_md5=good, actual_md5=good)
+        assert res.valid
+        # A wrong precomputed digest fails even though the file itself is fine.
+        res2 = Md5ValidationProvider().validate(p, 8, expected_md5=good, actual_md5="f" * 32)
+        assert not res2.valid
