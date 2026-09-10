@@ -986,3 +986,83 @@ class TestFullRunWithMd5sums:
         # Downloads used the foreign file host, not the metadata host.
         assert any(meta_host not in u for u in client.request_counts)
         assert all(file_host in u for u in client.request_counts)
+
+
+# --- Atomic + lock-guarded manifest writes (recommendation A) ---
+
+class TestAtomicManifestWrites:
+    def test_save_is_atomic_no_temp_left_behind(self, sample_order_data, tmp_download_folder):
+        sm = StateManager(tmp_download_folder, "DO25-11328")
+        sm.load_or_create(sample_order_data)
+        sm.save()
+        # No leftover temp files in the folder after a successful save.
+        leftovers = [p.name for p in tmp_download_folder.iterdir() if ".tmp." in p.name]
+        assert leftovers == []
+        # The manifest is valid JSON and round-trips.
+        loaded = DownloadManifest.model_validate_json(
+            (tmp_download_folder / "download_manifest.json").read_text()
+        )
+        assert loaded.order_number == "DO25-11328"
+
+    def test_crash_during_write_preserves_previous_manifest(
+        self, sample_order_data, tmp_download_folder, monkeypatch
+    ):
+        """A torn write (process dies mid-write) must not corrupt the existing
+        manifest: os.replace is atomic, and we write to a temp file first."""
+        sm = StateManager(tmp_download_folder, "DO25-11328")
+        sm.load_or_create(sample_order_data)
+        # Complete one file so there's meaningful state to protect.
+        first = sm.manifest.files[0]
+        sm.mark_completed(first.filename, first.expected_size)
+        good_bytes = (tmp_download_folder / "download_manifest.json").read_bytes()
+
+        # Simulate a crash *during* the temp-file write.
+        import builtins
+        real_open = builtins.open
+
+        def exploding_open(path, *a, **k):
+            if ".tmp." in str(path):
+                raise OSError("simulated crash mid-write")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", exploding_open)
+        with pytest.raises(OSError):
+            sm.mark_completed(sm.manifest.files[1].filename, 123)
+        monkeypatch.undo()
+
+        # The original manifest on disk is intact (never truncated/half-written).
+        assert (tmp_download_folder / "download_manifest.json").read_bytes() == good_bytes
+        # And it still parses.
+        DownloadManifest.model_validate_json(
+            (tmp_download_folder / "download_manifest.json").read_text()
+        )
+        # No temp file left behind.
+        assert [p.name for p in tmp_download_folder.iterdir() if ".tmp." in p.name] == []
+
+    def test_concurrent_state_updates_are_serialized(self, tmp_download_folder):
+        """Many threads marking different files completed must not corrupt the
+        manifest or lose updates (lock-guarded mutation + atomic write)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        files = [
+            OrderFile(filename=f"f{i}.gz", filesizeinbyte=100 + i, filetype="RawData",
+                      fileurl=f"http://x/f{i}", modifieddatetime="2026-01-01")
+            for i in range(50)
+        ]
+        order = OrderData(ordernumber="X", orderstatus="complete", productname="P",
+                          numberofsamples=1, files=files)
+        sm = StateManager(tmp_download_folder, "X")
+        sm.load_or_create(order)
+
+        def complete(i):
+            sm.mark_completed(f"f{i}.gz", 100 + i)
+
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            list(ex.map(complete, range(50)))
+
+        # Every update landed and the on-disk manifest is valid.
+        loaded = DownloadManifest.model_validate_json(
+            (tmp_download_folder / "download_manifest.json").read_text()
+        )
+        completed = [f for f in loaded.files if f.status == FileStatus.COMPLETED]
+        assert len(completed) == 50
