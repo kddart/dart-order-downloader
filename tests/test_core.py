@@ -392,8 +392,9 @@ from dart_downloader.models.models import OrderData, OrderFile
 
 
 class _FakeResponse:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, status_code: int = 200):
         self._data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None
@@ -403,20 +404,62 @@ class _FakeResponse:
             yield self._data[i : i + chunk_size]
 
 
+def _parse_range(headers) -> int | None:
+    """Return the start offset of a 'Range: bytes=<start>-' header, or None."""
+    if not headers:
+        return None
+    rng = headers.get("Range") or headers.get("range")
+    if not rng or not rng.startswith("bytes="):
+        return None
+    start = rng[len("bytes="):].split("-", 1)[0]
+    return int(start) if start else 0
+
+
 class _FakeClient:
     """Serves bytes per-URL. `contents` maps fileurl -> bytes (or a callable
-    returning bytes, so a file can change between download attempts)."""
+    returning bytes, so a file can change between download attempts).
 
-    def __init__(self, contents):
+    Honours ``Range: bytes=<start>-`` requests by returning a 206 with the
+    sliced tail — modelling a range-capable backend (Wasabi S3). To model a
+    backend that does NOT support ranges (so the client must fall back to a full
+    download), pass ``supports_range=False``: the client then ignores the Range
+    header and returns the whole body with status 200.
+    """
+
+    def __init__(self, contents, supports_range: bool = True):
         self._contents = contents
+        self._supports_range = supports_range
         self.request_counts: dict[str, int] = {}
+        self.range_starts: dict[str, list[int]] = {}
 
     @contextmanager
-    def stream(self, method, url):
+    def stream(self, method, url, headers=None):
         self.request_counts[url] = self.request_counts.get(url, 0) + 1
         value = self._contents[url]
         data = value(self.request_counts[url]) if callable(value) else value
-        yield _FakeResponse(data)
+
+        start = _parse_range(headers)
+        if start is not None:
+            self.range_starts.setdefault(url, []).append(start)
+        if self._supports_range and start:
+            yield _FakeResponse(data[start:], status_code=206)
+        else:
+            # No range requested, or backend ignores ranges: full body, 200.
+            yield _FakeResponse(data, status_code=200)
+
+    def get(self, url, headers=None):
+        # Minimal non-streaming GET used by size probing (returns full response).
+        self.request_counts[url] = self.request_counts.get(url, 0) + 1
+        value = self._contents[url]
+        data = value(self.request_counts[url]) if callable(value) else value
+        start = _parse_range(headers)
+        if self._supports_range and start is not None:
+            resp = _FakeResponse(data[start:], status_code=206)
+        else:
+            resp = _FakeResponse(data, status_code=200)
+        resp.content = data if start is None else data[start:]
+        resp.headers = {"content-range": f"bytes 0-0/{len(data)}"}
+        return resp
 
     def __enter__(self):
         return self
@@ -1066,3 +1109,71 @@ class TestAtomicManifestWrites:
         )
         completed = [f for f in loaded.files if f.status == FileStatus.COMPLETED]
         assert len(completed) == 50
+
+
+# --- Byte-offset (partial-file) resume (recommendation B) ---
+
+class TestByteOffsetResume:
+    def _single_file_order(self, folder, payload):
+        base = "https://ex.invalid/RawData"
+        files = [
+            OrderFile(filename="big.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/big.gz", modifieddatetime="2026-01-01"),
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = _make_engine(sm, folder)
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+        return sm, eng, f"{base}/big.gz"
+
+    def test_resume_appends_from_partial(self, tmp_download_folder):
+        payload = b"ABCDEFGHIJ" * 100  # 1000 bytes
+        sm, eng, url = self._single_file_order(tmp_download_folder, payload)
+        # Pre-seed a partial file (first 400 bytes) as if a prior run stopped.
+        fp = eng._get_filepath(sm.manifest.files[0])
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_bytes(payload[:400])
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        # File completed and correct, and the server was asked to resume at 400.
+        assert fp.read_bytes() == payload
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+        assert client.range_starts.get(url) == [400]
+
+    def test_falls_back_to_full_when_range_ignored(self, tmp_download_folder):
+        payload = b"XYZ" * 500  # 1500 bytes
+        sm, eng, url = self._single_file_order(tmp_download_folder, payload)
+        fp = eng._get_filepath(sm.manifest.files[0])
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_bytes(payload[:600])  # partial on disk
+
+        # Backend ignores Range -> returns full body + 200. Client must overwrite
+        # cleanly (not append onto the partial, which would corrupt the file).
+        client = _FakeClient({url: payload}, supports_range=False)
+        eng._download_file(client, sm.manifest.files[0])
+
+        assert fp.read_bytes() == payload
+        assert fp.stat().st_size == len(payload)
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+
+    def test_oversized_partial_is_discarded(self, tmp_download_folder):
+        payload = b"Q" * 300
+        sm, eng, url = self._single_file_order(tmp_download_folder, payload)
+        fp = eng._get_filepath(sm.manifest.files[0])
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        # Stale partial that's already >= expected size must not be trusted.
+        fp.write_bytes(b"Z" * 500)
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        assert fp.read_bytes() == payload
+        assert fp.stat().st_size == len(payload)
+        # No resume attempt was made (started clean from 0).
+        assert client.range_starts.get(url, []) == []

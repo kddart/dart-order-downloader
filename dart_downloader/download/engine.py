@@ -247,7 +247,13 @@ class DownloadEngine:
         for attempt in range(MAX_RETRIES):
             try:
                 self._state_manager.increment_retry(file_state.filename)
-                self._stream_to_disk(client, file_state.fileurl, filepath, file_state.filename)
+                self._stream_to_disk(
+                    client,
+                    file_state.fileurl,
+                    filepath,
+                    file_state.filename,
+                    expected_size=file_state.expected_size,
+                )
 
                 result = self._validator.validate(filepath, file_state.expected_size)
                 if result.valid:
@@ -315,8 +321,13 @@ class DownloadEngine:
                         time.sleep(wait)
 
             except (httpx.HTTPError, OSError) as e:
-                if filepath.exists():
-                    filepath.unlink()
+                # A network drop mid-stream (HTTPError) leaves a valid partial we
+                # can resume from on the next attempt, so we deliberately keep
+                # it. A local filesystem error (OSError) may mean the partial is
+                # unreliable, so discard it and start clean next time.
+                if isinstance(e, OSError) and not isinstance(e, httpx.HTTPError):
+                    if filepath.exists():
+                        filepath.unlink()
                 if attempt < MAX_RETRIES - 1:
                     wait = BACKOFF_BASE ** attempt
                     logger.warning(
@@ -341,11 +352,58 @@ class DownloadEngine:
             self._progress_callback(file_state.filename, "failed")
 
     def _stream_to_disk(
-        self, client: httpx.Client, url: str, filepath: Path, filename: str
+        self,
+        client: httpx.Client,
+        url: str,
+        filepath: Path,
+        filename: str,
+        expected_size: int | None = None,
     ):
-        with client.stream("GET", url) as response:
+        """Stream ``url`` to ``filepath``, resuming from a partial file if one
+        exists.
+
+        If a partial file is already on disk, request ``Range: bytes=<n>-`` and
+        append, so an interrupted download continues from where it stopped
+        instead of restarting from zero. Resume is only kept if the server
+        honours the range (responds ``206``); if it ignores the range and sends
+        the whole body (``200``), we transparently fall back to a clean full
+        download (truncating first). A partial that is already >= the expected
+        size is discarded and re-fetched, since it can't be trusted.
+        """
+        resume_from = 0
+        if filepath.exists():
+            existing = filepath.stat().st_size
+            # Only resume a strictly-partial file. A partial that already meets
+            # or exceeds the expected size is suspect (stale/oversized) — start
+            # clean so validation isn't fooled by leftover bytes.
+            if expected_size is not None and existing >= expected_size:
+                resume_from = 0
+            elif existing > 0:
+                resume_from = existing
+
+        headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+        with client.stream("GET", url, headers=headers) as response:
             response.raise_for_status()
-            with open(filepath, "wb") as f:
+
+            # Did the server actually honour the resume request? A 206 means
+            # yes (append); anything else (typically 200) means it's sending the
+            # whole object, so we must overwrite from the start.
+            resuming = resume_from > 0 and response.status_code == 206
+            mode = "r+b" if resuming else "wb"
+
+            # Seed progress with the bytes we already have on disk when resuming,
+            # so the progress bar reflects true completion rather than restarting.
+            with self._lock:
+                progress = self._progress.get(filename)
+                if progress is not None:
+                    progress.bytes_downloaded = resume_from if resuming else 0
+
+            with open(filepath, mode) as f:
+                if resuming:
+                    f.seek(resume_from)
+                else:
+                    # Full (re)download: ensure we don't leave stale trailing bytes.
+                    f.truncate(0)
                 for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
                     f.write(chunk)
                     with self._lock:
