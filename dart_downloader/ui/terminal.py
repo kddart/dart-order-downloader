@@ -142,6 +142,26 @@ def confirm_no_md5sums() -> bool:
     return answer == "y"
 
 
+# Cap how many per-file rows we show at once, so an order with thousands of
+# files doesn't flood the terminal. The overall bar always reflects everything.
+MAX_ACTIVE_ROWS = 8
+
+
+def _select_active_files(progresses, limit: int = MAX_ACTIVE_ROWS):
+    """Pick the in-flight files to show as their own rows.
+
+    "In-flight" = started (some bytes) but not yet completed or failed. Ordered
+    by most bytes downloaded so the largest/most-active transfers stay visible;
+    capped at ``limit``. Pure function so it can be unit-tested without rich.
+    """
+    active = [
+        p for p in progresses
+        if p.bytes_downloaded > 0 and not p.completed and not p.failed
+    ]
+    active.sort(key=lambda p: p.bytes_downloaded, reverse=True)
+    return active[:limit]
+
+
 def run_with_progress(engine: DownloadEngine, total_files: int, total_bytes: int):
     show_downloading()
     stop_event = Event()
@@ -156,12 +176,39 @@ def run_with_progress(engine: DownloadEngine, total_files: int, total_bytes: int
         console=console,
     )
 
-    overall_task = progress.add_task("Downloading", total=total_bytes)
+    overall_task = progress.add_task("[bold]Overall[/bold]", total=total_bytes)
+    # Lazily-created per-file rows: filename -> rich task id.
+    file_tasks: dict[str, int] = {}
+
+    def _short(name: str, width: int = 32) -> str:
+        return name if len(name) <= width else name[: width - 1] + "…"
+
+    def _refresh():
+        by_name = engine.progress
+        downloaded = sum(p.bytes_downloaded for p in by_name.values())
+        progress.update(overall_task, completed=downloaded)
+
+        active = _select_active_files(list(by_name.values()))
+        active_names = {p.filename for p in active}
+
+        # Add rows for newly-active files (per-file rate + ETA come from rich
+        # tracking each task's completed/total over time).
+        for p in active:
+            if p.filename not in file_tasks:
+                file_tasks[p.filename] = progress.add_task(
+                    _short(p.filename), total=p.total_bytes or None
+                )
+            progress.update(file_tasks[p.filename], completed=p.bytes_downloaded)
+
+        # Drop rows for files that are no longer in-flight (done/failed), so the
+        # display stays focused on current work.
+        for name in list(file_tasks):
+            if name not in active_names:
+                progress.remove_task(file_tasks.pop(name))
 
     def update_loop():
         while not stop_event.is_set():
-            downloaded = sum(p.bytes_downloaded for p in engine.progress.values())
-            progress.update(overall_task, completed=downloaded)
+            _refresh()
             time.sleep(0.5)
 
     with progress:
@@ -170,6 +217,7 @@ def run_with_progress(engine: DownloadEngine, total_files: int, total_bytes: int
         engine.run()
         stop_event.set()
         updater.join(timeout=2)
+        # Final overall update so the bar lands on the true total.
         downloaded = sum(p.bytes_downloaded for p in engine.progress.values())
         progress.update(overall_task, completed=downloaded)
 

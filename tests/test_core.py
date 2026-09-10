@@ -1379,3 +1379,55 @@ class TestInlineHashing:
         # A wrong precomputed digest fails even though the file itself is fine.
         res2 = Md5ValidationProvider().validate(p, 8, expected_md5=good, actual_md5="f" * 32)
         assert not res2.valid
+
+
+# --- Progress UI: per-file status/rate/ETA selection (recommendation E) ---
+
+from dart_downloader.models.models import DownloadProgress
+
+
+class TestProgressSelection:
+    def _p(self, name, done, total, completed=False, failed=False):
+        return DownloadProgress(filename=name, bytes_downloaded=done,
+                                total_bytes=total, completed=completed, failed=failed)
+
+    def test_only_inflight_files_are_shown(self):
+        from dart_downloader.ui.terminal import _select_active_files
+        ps = [
+            self._p("started.gz", 50, 100),                    # in-flight -> show
+            self._p("notstarted.gz", 0, 100),                  # not started -> hide
+            self._p("done.gz", 100, 100, completed=True),      # completed -> hide
+            self._p("bad.gz", 30, 100, failed=True),           # failed -> hide
+        ]
+        active = _select_active_files(ps)
+        assert [p.filename for p in active] == ["started.gz"]
+
+    def test_ordered_by_bytes_and_capped(self):
+        from dart_downloader.ui.terminal import _select_active_files
+        ps = [self._p(f"f{i}.gz", done=i * 10, total=1000) for i in range(1, 12)]
+        active = _select_active_files(ps, limit=3)
+        # Most-active first, capped to the limit.
+        assert [p.filename for p in active] == ["f11.gz", "f10.gz", "f9.gz"]
+
+    def test_run_with_progress_smoke(self, monkeypatch):
+        """run_with_progress drives to completion against a fake engine that
+        reports progress, without raising and cleaning up per-file rows."""
+        from dart_downloader.ui import terminal as ui
+
+        class _FakeEngine:
+            def __init__(self):
+                self.progress = {
+                    "a.gz": DownloadProgress(filename="a.gz", bytes_downloaded=0, total_bytes=100),
+                    "b.gz": DownloadProgress(filename="b.gz", bytes_downloaded=0, total_bytes=100),
+                }
+
+            def run(self):
+                # Simulate some transfer then completion.
+                self.progress["a.gz"].bytes_downloaded = 100
+                self.progress["a.gz"].completed = True
+                self.progress["b.gz"].bytes_downloaded = 100
+                self.progress["b.gz"].completed = True
+
+        # Speed up the updater loop.
+        monkeypatch.setattr(ui.time, "sleep", lambda *_: None)
+        ui.run_with_progress(_FakeEngine(), total_files=2, total_bytes=200)
