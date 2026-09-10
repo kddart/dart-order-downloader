@@ -1,0 +1,13 @@
+# This project is run as a module (`python -m dart_downloader`) after installing
+# runtime dependencies from requirements.txt — it is not distributed as an
+# installable package, so there is intentionally no [project.dependencies],
+# [project.scripts], or [tool.setuptools] here. Dependencies live solely in
+# requirements.txt to avoid drift.
+[project]
+name = "dart-order-downloader"
+version = "1.0.0"
+description = "DArT Genomic Data Download Assistant"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

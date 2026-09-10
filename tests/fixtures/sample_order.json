@@ -1,0 +1,47 @@
+{
+  "data": [
+    {
+      "ordernumber": "DO25-11328",
+      "orderstatus": "complete",
+      "productname": "Oat DArTseq (1.0)",
+      "numberofsamples": 376,
+      "files": [
+        {
+          "filename": "DO25-11328_RawData_part1.fastq.gz",
+          "filesizeinbyte": 104857600,
+          "filetype": "RawData",
+          "fileurl": "https://example.invalid/orders/DO25-11328/DO25-11328_RawData_part1.fastq.gz",
+          "modifieddatetime": "2025-05-01T09:15:00Z"
+        },
+        {
+          "filename": "DO25-11328_RawData_part2.fastq.gz",
+          "filesizeinbyte": 98566144,
+          "filetype": "RawData",
+          "fileurl": "https://example.invalid/orders/DO25-11328/DO25-11328_RawData_part2.fastq.gz",
+          "modifieddatetime": "2025-05-01T09:16:30Z"
+        },
+        {
+          "filename": "DO25-11328_Report.pdf",
+          "filesizeinbyte": 2097152,
+          "filetype": "Report",
+          "fileurl": "https://example.invalid/orders/DO25-11328/DO25-11328_Report.pdf",
+          "modifieddatetime": "2025-05-02T14:02:11Z"
+        },
+        {
+          "filename": "DO25-11328_OrderAppendix.pdf",
+          "filesizeinbyte": 524288,
+          "filetype": "OrderAppendix",
+          "fileurl": "https://example.invalid/orders/DO25-11328/DO25-11328_OrderAppendix.pdf",
+          "modifieddatetime": "2025-05-02T14:03:00Z"
+        },
+        {
+          "filename": "DO25-11328_DArTseq_counts.csv",
+          "filesizeinbyte": 15728640,
+          "filetype": "Counts",
+          "fileurl": "https://example.invalid/orders/DO25-11328/DO25-11328_DArTseq_counts.csv",
+          "modifieddatetime": "2025-05-02T14:05:45Z"
+        }
+      ]
+    }
+  ]
+}
