@@ -86,10 +86,17 @@ def show_validation_complete(valid_count: int, total_count: int):
     console.print()
 
 
-def show_md5_verified(verified_count: int, total_count: int):
+def show_md5_verified(verified_count: int, checkable_count: int, na_count: int):
+    """Report MD5 verification. ``checkable_count`` is the number of files that
+    had a checksum in MD5SUMS; ``na_count`` is the number with no entry."""
     console.print(
-        f"[green]✓ MD5 verified:[/green] {verified_count}/{total_count} files match their MD5 checksum."
+        f"[green]✓ MD5 verified:[/green] {verified_count}/{checkable_count} "
+        f"files with checksums match."
     )
+    if na_count:
+        console.print(
+            f"[dim]  ({na_count} file(s) had no MD5 entry and were checked by size only.)[/dim]"
+        )
     console.print()
 
 
@@ -188,7 +195,10 @@ def show_report(report: dict, download_folder: Path):
     table.add_row("Files Downloaded", str(report["files_downloaded"]))
     table.add_row("Files Validated by Size", str(sum(1 for f in report["downloaded_files"] if f["validated"])))
     if report["md5sums_available"]:
-        table.add_row("Files MD5 Verified", str(report["files_md5_verified"]))
+        table.add_row(
+            "Files MD5 Verified",
+            f"{report['files_md5_verified']}/{report['files_md5_checkable']} with checksums",
+        )
     else:
         table.add_row("Files MD5 Verified", "[yellow]n/a - no MD5SUMS[/yellow]")
     table.add_row("Files Failed", str(report["files_failed"]))

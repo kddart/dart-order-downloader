@@ -34,6 +34,12 @@ class ReportGenerator:
         md5_verified = sum(
             1 for f in completed if f.md5_status and f.md5_status.value == "verified"
         )
+        # Files MD5SUMS actually covered (verified or mismatch) — the meaningful
+        # denominator when reporting how many checksums matched.
+        md5_checkable = sum(
+            1 for f in completed
+            if f.md5_status and f.md5_status.value in ("verified", "mismatch")
+        )
         # MD5SUMS was available for the order if at least one file was verified.
         md5sums_available = md5_verified > 0
 
@@ -42,6 +48,7 @@ class ReportGenerator:
             "download_folder": manifest.download_folder,
             "files_downloaded": len(completed),
             "files_md5_verified": md5_verified,
+            "files_md5_checkable": md5_checkable,
             "md5sums_available": md5sums_available,
             "files_failed": len(failed),
             "total_data_downloaded_bytes": total_downloaded,
@@ -125,7 +132,8 @@ class ReportGenerator:
             "-" * 40,
             f"  Total Data Downloaded: {report['total_data_downloaded']}",
             (
-                f"  MD5 Verified:          {report['files_md5_verified']}/{report['files_downloaded']}"
+                f"  MD5 Verified:          {report['files_md5_verified']}/{report['files_md5_checkable']}"
+                f" files with checksums"
                 if report["md5sums_available"]
                 else "  MD5 Verified:          NOT AVAILABLE - no MD5SUMS file; contents verified by size only"
             ),

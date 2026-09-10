@@ -158,13 +158,21 @@ def _run() -> int:
     completed_md5_verified = sum(
         1 for f in completed if f.md5_status and f.md5_status.value == "verified"
     )
+    # Files that MD5SUMS actually covered (verified or mismatch) — the meaningful
+    # denominator. Files with no entry (na) were checked by size only.
+    md5_checkable = sum(
+        1 for f in completed if f.md5_status and f.md5_status.value in ("verified", "mismatch")
+    )
+    md5_na = sum(
+        1 for f in completed if not f.md5_status or f.md5_status.value == "na"
+    )
     # On a resumed/already-complete run no engine ran this time, so infer whether
     # MD5SUMS was available from whether any file was previously verified.
     if not md5_available and completed_md5_verified > 0:
         md5_available = True
 
     if md5_available:
-        terminal.show_md5_verified(completed_md5_verified, len(completed))
+        terminal.show_md5_verified(completed_md5_verified, md5_checkable, md5_na)
     else:
         terminal.show_md5_unavailable_warning()
 

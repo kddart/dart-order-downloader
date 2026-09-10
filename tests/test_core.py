@@ -357,6 +357,9 @@ class TestMd5Reporting:
 
         assert report["files_md5_verified"] == 1
         assert report["md5sums_available"] is True
+        # Only the file with a checksum counts toward "checkable"; the n/a file
+        # (no MD5 entry) is excluded from the denominator.
+        assert report["files_md5_checkable"] == 1
         by_name = {e["filename"]: e for e in report["downloaded_files"]}
         assert by_name[files[0].filename]["md5_status"] == "verified"
         assert by_name[files[1].filename]["md5_status"] == "na"
