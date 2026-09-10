@@ -40,7 +40,7 @@ def show_welcome():
 def prompt_inputs() -> tuple[str, str, Path]:
     console.print()
     # Mask the token: it's a secret, so hide it as it's typed/pasted (no echo).
-    share_token = Prompt.ask("[bold]Share Token[/bold]", password=True)
+    share_token = Prompt.ask("[bold]Share Token[/bold] [dim](hidden)[/dim]", password=True)
     order_number = Prompt.ask("[bold]Order Number[/bold]")
     # Default to a folder in the current directory — predictable and portable
     # across macOS/Windows/Linux, with no assumptions about a ~/Downloads folder.
