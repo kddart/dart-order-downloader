@@ -441,7 +441,8 @@ class _FakeClient:
         start = _parse_range(headers)
         if start is not None:
             self.range_starts.setdefault(url, []).append(start)
-        if self._supports_range and start:
+        if self._supports_range and start is not None:
+            # A ranged request (including bytes=0-...) yields 206 + sliced tail.
             yield _FakeResponse(data[start:], status_code=206)
         else:
             # No range requested, or backend ignores ranges: full body, 200.
@@ -1177,3 +1178,123 @@ class TestByteOffsetResume:
         assert fp.stat().st_size == len(payload)
         # No resume attempt was made (started clean from 0).
         assert client.range_starts.get(url, []) == []
+
+
+# --- Within-file parallel ranged download (recommendation C) ---
+
+class TestParallelRangedDownload:
+    def _big_file_order(self, folder, payload):
+        base = "https://ex.invalid/RawData"
+        files = [
+            OrderFile(filename="big.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/big.gz", modifieddatetime="2026-01-01"),
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = _make_engine(sm, folder)  # concurrency=1 by default in helper
+        return sm, eng, f"{base}/big.gz"
+
+    def _seed_progress(self, eng, sm):
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+
+    def test_large_file_downloads_in_parallel_segments(self, tmp_download_folder, monkeypatch):
+        # Shrink thresholds so a small payload exercises the parallel path.
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        payload = bytes((i % 256) for i in range(1000))  # 1000 bytes -> ~16 segments
+
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        eng._concurrency = 4  # allow parallelism
+        eng._conn_budget = __import__("threading").BoundedSemaphore(4)
+        self._seed_progress(eng, sm)
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload  # reassembled byte-identical
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+        # Multiple distinct range starts were requested (i.e. it really split).
+        starts = client.range_starts.get(url, [])
+        # First entry is the 1-byte range-support probe (start 0); the rest are
+        # the real segments. Expect more than one distinct segment start.
+        assert len(set(starts)) > 2
+
+    def test_falls_back_to_single_stream_when_no_range_support(
+        self, tmp_download_folder, monkeypatch
+    ):
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        payload = b"N" * 1000
+
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        eng._concurrency = 4
+        eng._conn_budget = __import__("threading").BoundedSemaphore(4)
+        self._seed_progress(eng, sm)
+
+        # Backend does NOT support ranges -> probe returns 200 -> single stream.
+        client = _FakeClient({url: payload}, supports_range=False)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+
+    def test_small_file_stays_single_stream(self, tmp_download_folder, monkeypatch):
+        # With the real 64MB threshold, a small file must not use ranges at all.
+        payload = b"small-file-contents"
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        eng._concurrency = 8
+        eng._conn_budget = __import__("threading").BoundedSemaphore(8)
+        self._seed_progress(eng, sm)
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload
+        # No ranged requests were made (no probe, no segments): fully single-stream.
+        assert client.range_starts.get(url, []) == []
+
+    def test_connection_budget_is_respected(self, tmp_download_folder, monkeypatch):
+        """Concurrent segments must never exceed the connection budget."""
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        payload = bytes((i % 256) for i in range(2000))
+
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        budget = 3
+        eng._concurrency = budget
+        eng._conn_budget = __import__("threading").BoundedSemaphore(budget)
+        self._seed_progress(eng, sm)
+
+        # Instrument the fake to track peak concurrent in-flight streams.
+        import threading
+        state = {"cur": 0, "peak": 0}
+        lock = threading.Lock()
+        base_client = _FakeClient({url: payload}, supports_range=True)
+        real_stream = base_client.stream
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def counting_stream(method, u, headers=None):
+            with lock:
+                state["cur"] += 1
+                state["peak"] = max(state["peak"], state["cur"])
+            try:
+                with real_stream(method, u, headers=headers) as resp:
+                    yield resp
+            finally:
+                with lock:
+                    state["cur"] -= 1
+
+        base_client.stream = counting_stream
+        eng._download_file(base_client, sm.manifest.files[0])
+
+        assert state["peak"] <= budget
+        assert eng._get_filepath(sm.manifest.files[0]).read_bytes() == payload

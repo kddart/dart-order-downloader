@@ -4,7 +4,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 
 import httpx
 
@@ -26,6 +26,19 @@ MD5_MAX_RETRIES = 2  # extra re-downloads allowed when MD5 content check fails
 CONNECT_TIMEOUT = 30.0
 READ_TIMEOUT = 300.0
 BACKOFF_BASE = 2.0
+
+# Within-file parallelism (recommendation C). Files at least this large are
+# downloaded as multiple byte-range segments in parallel *when the server
+# supports ranged GETs*, which dramatically improves throughput on lossy links
+# (e.g. satellite) where a single TCP flow is loss-limited. Smaller files are
+# downloaded in a single stream — the setup overhead isn't worth it.
+PARALLEL_MIN_FILE_SIZE = 64 * 1024 * 1024  # 64 MB
+PARALLEL_SEGMENT_SIZE = 16 * 1024 * 1024   # 16 MB per range segment
+
+
+class _RangeUnsupported(Exception):
+    """Raised mid-download when a backend stops honouring range requests, so the
+    caller can fall back to a single-stream download."""
 
 
 class DownloadEngine:
@@ -49,6 +62,11 @@ class DownloadEngine:
         self._progress_callback = progress_callback
         self._lock = Lock()
         self._progress: dict[str, DownloadProgress] = {}
+        # Global connection budget shared across all in-flight downloads. The
+        # file-level thread pool and any within-file range workers all acquire a
+        # slot here, so the total number of concurrent HTTP connections never
+        # exceeds `concurrency` regardless of how work is split into segments.
+        self._conn_budget = BoundedSemaphore(max(1, concurrency))
 
     @property
     def progress(self) -> dict[str, DownloadProgress]:
@@ -247,13 +265,7 @@ class DownloadEngine:
         for attempt in range(MAX_RETRIES):
             try:
                 self._state_manager.increment_retry(file_state.filename)
-                self._stream_to_disk(
-                    client,
-                    file_state.fileurl,
-                    filepath,
-                    file_state.filename,
-                    expected_size=file_state.expected_size,
-                )
+                self._fetch_to_disk(client, file_state, filepath)
 
                 result = self._validator.validate(filepath, file_state.expected_size)
                 if result.valid:
@@ -350,6 +362,141 @@ class DownloadEngine:
             self._progress[file_state.filename].failed = True
         if self._progress_callback:
             self._progress_callback(file_state.filename, "failed")
+
+    def _fetch_to_disk(
+        self, client: httpx.Client, file_state: FileState, filepath: Path
+    ):
+        """Fetch a single file to disk, choosing the download strategy.
+
+        Large files are downloaded as parallel byte-range segments *if the
+        backend supports ranged GETs*; this is the big throughput win on
+        lossy/high-latency links. Everything else (small files, or backends that
+        don't support ranges) uses a single resumable stream. Range support is
+        probed per file at download time because the order's file URLs are 302
+        redirects that can land on different backends — some may not support
+        ranges — so we must not assume.
+        """
+        expected = file_state.expected_size
+        url = file_state.fileurl
+        filename = file_state.filename
+
+        use_parallel = (
+            self._concurrency > 1
+            and expected >= PARALLEL_MIN_FILE_SIZE
+            and self._supports_range(client, url)
+        )
+        if use_parallel:
+            try:
+                self._parallel_ranged_download(client, url, filepath, filename, expected)
+                return
+            except _RangeUnsupported:
+                # A segment saw a non-206 mid-flight: the backend isn't honouring
+                # ranges after all. Fall back to a clean single-stream download.
+                logger.info(
+                    "Ranged download not honoured for %s; falling back to single stream.",
+                    filename,
+                )
+
+        self._stream_to_disk(client, url, filepath, filename, expected_size=expected)
+
+    def _supports_range(self, client: httpx.Client, url: str) -> bool:
+        """Probe whether the backend serving ``url`` honours range requests.
+
+        Sends a tiny ranged GET (first byte) and checks for ``206 Partial
+        Content``. HEAD is not used because the backend (observed: Wasabi S3 via
+        302) can reject HEAD while still serving ranged GETs. Any error or a
+        non-206 response is treated as "no range support" so we fall back safely.
+        """
+        try:
+            with self._conn_budget:
+                with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as resp:
+                    return resp.status_code == 206
+        except httpx.HTTPError:
+            return False
+
+    def _parallel_ranged_download(
+        self,
+        client: httpx.Client,
+        url: str,
+        filepath: Path,
+        filename: str,
+        total: int,
+    ):
+        """Download ``url`` as parallel byte-range segments into ``filepath``.
+
+        The output file is pre-allocated to its full size, then each segment is
+        fetched concurrently and written at its correct offset. The total number
+        of concurrent connections is bounded by the shared connection budget, so
+        splitting a file into many segments never exceeds ``concurrency`` live
+        connections across the whole run. Raises ``_RangeUnsupported`` if a
+        segment response isn't a 206, so the caller can fall back cleanly.
+        """
+        # Build contiguous [start, end] byte ranges.
+        segments: list[tuple[int, int]] = []
+        pos = 0
+        while pos < total:
+            end = min(pos + PARALLEL_SEGMENT_SIZE - 1, total - 1)
+            segments.append((pos, end))
+            pos = end + 1
+
+        # Pre-allocate so every worker can seek to its offset and write.
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "wb") as f:
+            f.truncate(total)
+
+        # Reset progress for a clean parallel (re)download of this file.
+        with self._lock:
+            progress = self._progress.get(filename)
+            if progress is not None:
+                progress.bytes_downloaded = 0
+
+        workers = min(len(segments), self._concurrency)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(self._download_segment, client, url, filepath, filename, s, e)
+                for (s, e) in segments
+            ]
+            errors = []
+            for fut in futures:
+                try:
+                    fut.result()
+                except _RangeUnsupported:
+                    raise
+                except (httpx.HTTPError, OSError) as exc:
+                    errors.append(exc)
+            if errors:
+                # Surface the first error to the retry loop in _download_file.
+                raise errors[0]
+
+    def _download_segment(
+        self,
+        client: httpx.Client,
+        url: str,
+        filepath: Path,
+        filename: str,
+        start: int,
+        end: int,
+    ):
+        """Fetch one [start, end] byte range and write it at its file offset.
+
+        Acquires a slot from the shared connection budget for the duration of the
+        transfer, so concurrent segments (across all files) stay within the
+        configured connection limit.
+        """
+        with self._conn_budget:
+            with client.stream("GET", url, headers={"Range": f"bytes={start}-{end}"}) as resp:
+                if resp.status_code != 206:
+                    raise _RangeUnsupported(filename)
+                with open(filepath, "r+b") as f:
+                    f.seek(start)
+                    for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
+                        f.write(chunk)
+                        with self._lock:
+                            progress = self._progress.get(filename)
+                            if progress is not None:
+                                progress.bytes_downloaded += len(chunk)
+                        if self._progress_callback:
+                            self._progress_callback(filename, "progress")
 
     def _stream_to_disk(
         self,
