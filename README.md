@@ -1,8 +1,10 @@
 # DArT Order Downloader
 
 A simple command-line tool for downloading the genomic data associated with your
-DArT order. It downloads every available file for an order, checks each file's
-size, resumes safely if interrupted, and writes a report when it finishes.
+DArT order. It downloads every available file for an order — using multiple
+connections per large file where the server supports it — checks each file's
+size, resumes from where it left off if interrupted, and writes a report when it
+finishes.
 
 ## Requirements
 
@@ -52,8 +54,9 @@ You'll be prompted for three things:
    you like (absolute or relative).
 
 The tool then fetches your order details, shows a summary, and downloads all
-available files with a live progress bar. When it's done it validates the files
-and prints a summary report.
+available files with a live progress display — an overall bar plus a row per
+active file showing its transfer rate and ETA. When it's done it validates the
+files and prints a summary report.
 
 ### File validation
 
@@ -80,9 +83,24 @@ checksum-verified.
 
 | Flag            | Default | Description                          |
 |-----------------|---------|--------------------------------------|
-| `--concurrency` | 8       | Number of simultaneous downloads     |
+| `--concurrency` | 8       | Maximum simultaneous connections     |
 | `--host`        | `ordering.diversityarrays.com` | Ordering server to fetch the order from |
 | `--debug`       | off     | Enable verbose debug logging         |
+
+`--concurrency` caps the total number of simultaneous HTTP connections. These
+are shared across the whole download: several small files can transfer at once,
+and a single large file can be split into multiple byte-range segments that
+download in parallel (when the server supports ranged requests). Either way, the
+total number of live connections never exceeds this limit. The default of 8 is a
+good balance; higher values mainly help on lossy, high-latency links (e.g.
+satellite) where a single connection is throughput-limited.
+
+Some files may be served from a DArT local server on a limited connection rather
+than from cloud storage. Downloads of those files are automatically capped to at
+most **4 at a time** (and never split across multiple connections), regardless
+of `--concurrency`, to avoid saturating that link. Files in cloud storage are
+unaffected and use the full connection budget. If you set `--concurrency` below
+4, that lower value applies to these files too.
 
 You normally won't need `--host` — it exists for testing against an alternate
 ordering server. You can also set it via the `DART_ORDERING_HOST` environment
@@ -107,6 +125,12 @@ If the tool is interrupted (network drop, closed terminal, etc.), just run it
 again and choose the **same download folder**. It detects the existing
 `download_manifest.json` in that folder and resumes where it left off — already
 completed files are not downloaded again.
+
+Resume works at the **byte level**: a file that was only partially downloaded
+picks up from where it stopped rather than starting over, so an interruption
+near the end of a large file doesn't mean re-downloading the whole thing. (If the
+server can't honour a resume request, the tool falls back to re-downloading that
+file cleanly.)
 
 On resume, completed files are re-checked by size, and any file that wasn't
 already MD5-verified is re-verified against `MD5SUMS` (when the order includes
