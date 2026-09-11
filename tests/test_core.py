@@ -395,8 +395,9 @@ from dart_downloader.models.models import OrderData, OrderFile
 
 
 class _FakeResponse:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, status_code: int = 200):
         self._data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None
@@ -406,20 +407,63 @@ class _FakeResponse:
             yield self._data[i : i + chunk_size]
 
 
+def _parse_range(headers) -> int | None:
+    """Return the start offset of a 'Range: bytes=<start>-' header, or None."""
+    if not headers:
+        return None
+    rng = headers.get("Range") or headers.get("range")
+    if not rng or not rng.startswith("bytes="):
+        return None
+    start = rng[len("bytes="):].split("-", 1)[0]
+    return int(start) if start else 0
+
+
 class _FakeClient:
     """Serves bytes per-URL. `contents` maps fileurl -> bytes (or a callable
-    returning bytes, so a file can change between download attempts)."""
+    returning bytes, so a file can change between download attempts).
 
-    def __init__(self, contents):
+    Honours ``Range: bytes=<start>-`` requests by returning a 206 with the
+    sliced tail — modelling a range-capable backend (Wasabi S3). To model a
+    backend that does NOT support ranges (so the client must fall back to a full
+    download), pass ``supports_range=False``: the client then ignores the Range
+    header and returns the whole body with status 200.
+    """
+
+    def __init__(self, contents, supports_range: bool = True):
         self._contents = contents
+        self._supports_range = supports_range
         self.request_counts: dict[str, int] = {}
+        self.range_starts: dict[str, list[int]] = {}
 
     @contextmanager
-    def stream(self, method, url):
+    def stream(self, method, url, headers=None):
         self.request_counts[url] = self.request_counts.get(url, 0) + 1
         value = self._contents[url]
         data = value(self.request_counts[url]) if callable(value) else value
-        yield _FakeResponse(data)
+
+        start = _parse_range(headers)
+        if start is not None:
+            self.range_starts.setdefault(url, []).append(start)
+        if self._supports_range and start is not None:
+            # A ranged request (including bytes=0-...) yields 206 + sliced tail.
+            yield _FakeResponse(data[start:], status_code=206)
+        else:
+            # No range requested, or backend ignores ranges: full body, 200.
+            yield _FakeResponse(data, status_code=200)
+
+    def get(self, url, headers=None):
+        # Minimal non-streaming GET used by size probing (returns full response).
+        self.request_counts[url] = self.request_counts.get(url, 0) + 1
+        value = self._contents[url]
+        data = value(self.request_counts[url]) if callable(value) else value
+        start = _parse_range(headers)
+        if self._supports_range and start is not None:
+            resp = _FakeResponse(data[start:], status_code=206)
+        else:
+            resp = _FakeResponse(data, status_code=200)
+        resp.content = data if start is None else data[start:]
+        resp.headers = {"content-range": f"bytes 0-0/{len(data)}"}
+        return resp
 
     def __enter__(self):
         return self
@@ -989,3 +1033,521 @@ class TestFullRunWithMd5sums:
         # Downloads used the foreign file host, not the metadata host.
         assert any(meta_host not in u for u in client.request_counts)
         assert all(file_host in u for u in client.request_counts)
+
+
+# --- Atomic + lock-guarded manifest writes (recommendation A) ---
+
+class TestAtomicManifestWrites:
+    def test_save_is_atomic_no_temp_left_behind(self, sample_order_data, tmp_download_folder):
+        sm = StateManager(tmp_download_folder, "DO25-11328")
+        sm.load_or_create(sample_order_data)
+        sm.save()
+        # No leftover temp files in the folder after a successful save.
+        leftovers = [p.name for p in tmp_download_folder.iterdir() if ".tmp." in p.name]
+        assert leftovers == []
+        # The manifest is valid JSON and round-trips.
+        loaded = DownloadManifest.model_validate_json(
+            (tmp_download_folder / "download_manifest.json").read_text()
+        )
+        assert loaded.order_number == "DO25-11328"
+
+    def test_crash_during_write_preserves_previous_manifest(
+        self, sample_order_data, tmp_download_folder, monkeypatch
+    ):
+        """A torn write (process dies mid-write) must not corrupt the existing
+        manifest: os.replace is atomic, and we write to a temp file first."""
+        sm = StateManager(tmp_download_folder, "DO25-11328")
+        sm.load_or_create(sample_order_data)
+        # Complete one file so there's meaningful state to protect.
+        first = sm.manifest.files[0]
+        sm.mark_completed(first.filename, first.expected_size)
+        good_bytes = (tmp_download_folder / "download_manifest.json").read_bytes()
+
+        # Simulate a crash *during* the temp-file write.
+        import builtins
+        real_open = builtins.open
+
+        def exploding_open(path, *a, **k):
+            if ".tmp." in str(path):
+                raise OSError("simulated crash mid-write")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", exploding_open)
+        with pytest.raises(OSError):
+            sm.mark_completed(sm.manifest.files[1].filename, 123)
+        monkeypatch.undo()
+
+        # The original manifest on disk is intact (never truncated/half-written).
+        assert (tmp_download_folder / "download_manifest.json").read_bytes() == good_bytes
+        # And it still parses.
+        DownloadManifest.model_validate_json(
+            (tmp_download_folder / "download_manifest.json").read_text()
+        )
+        # No temp file left behind.
+        assert [p.name for p in tmp_download_folder.iterdir() if ".tmp." in p.name] == []
+
+    def test_concurrent_state_updates_are_serialized(self, tmp_download_folder):
+        """Many threads marking different files completed must not corrupt the
+        manifest or lose updates (lock-guarded mutation + atomic write)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        files = [
+            OrderFile(filename=f"f{i}.gz", filesizeinbyte=100 + i, filetype="RawData",
+                      fileurl=f"http://x/f{i}", modifieddatetime="2026-01-01")
+            for i in range(50)
+        ]
+        order = OrderData(ordernumber="X", orderstatus="complete", productname="P",
+                          numberofsamples=1, files=files)
+        sm = StateManager(tmp_download_folder, "X")
+        sm.load_or_create(order)
+
+        def complete(i):
+            sm.mark_completed(f"f{i}.gz", 100 + i)
+
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            list(ex.map(complete, range(50)))
+
+        # Every update landed and the on-disk manifest is valid.
+        loaded = DownloadManifest.model_validate_json(
+            (tmp_download_folder / "download_manifest.json").read_text()
+        )
+        completed = [f for f in loaded.files if f.status == FileStatus.COMPLETED]
+        assert len(completed) == 50
+
+
+# --- Byte-offset (partial-file) resume (recommendation B) ---
+
+class TestByteOffsetResume:
+    def _single_file_order(self, folder, payload):
+        base = "https://ex.invalid/RawData"
+        files = [
+            OrderFile(filename="big.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/big.gz", modifieddatetime="2026-01-01"),
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = _make_engine(sm, folder)
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+        return sm, eng, f"{base}/big.gz"
+
+    def test_resume_appends_from_partial(self, tmp_download_folder):
+        payload = b"ABCDEFGHIJ" * 100  # 1000 bytes
+        sm, eng, url = self._single_file_order(tmp_download_folder, payload)
+        # Pre-seed a partial file (first 400 bytes) as if a prior run stopped.
+        fp = eng._get_filepath(sm.manifest.files[0])
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_bytes(payload[:400])
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        # File completed and correct, and the server was asked to resume at 400.
+        assert fp.read_bytes() == payload
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+        assert client.range_starts.get(url) == [400]
+
+    def test_falls_back_to_full_when_range_ignored(self, tmp_download_folder):
+        payload = b"XYZ" * 500  # 1500 bytes
+        sm, eng, url = self._single_file_order(tmp_download_folder, payload)
+        fp = eng._get_filepath(sm.manifest.files[0])
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_bytes(payload[:600])  # partial on disk
+
+        # Backend ignores Range -> returns full body + 200. Client must overwrite
+        # cleanly (not append onto the partial, which would corrupt the file).
+        client = _FakeClient({url: payload}, supports_range=False)
+        eng._download_file(client, sm.manifest.files[0])
+
+        assert fp.read_bytes() == payload
+        assert fp.stat().st_size == len(payload)
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+
+    def test_oversized_partial_is_discarded(self, tmp_download_folder):
+        payload = b"Q" * 300
+        sm, eng, url = self._single_file_order(tmp_download_folder, payload)
+        fp = eng._get_filepath(sm.manifest.files[0])
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        # Stale partial that's already >= expected size must not be trusted.
+        fp.write_bytes(b"Z" * 500)
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        assert fp.read_bytes() == payload
+        assert fp.stat().st_size == len(payload)
+        # No resume attempt was made (started clean from 0).
+        assert client.range_starts.get(url, []) == []
+
+
+# --- Within-file parallel ranged download (recommendation C) ---
+
+class TestParallelRangedDownload:
+    def _big_file_order(self, folder, payload):
+        base = "https://ex.invalid/RawData"
+        files = [
+            OrderFile(filename="big.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/big.gz", modifieddatetime="2026-01-01"),
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = _make_engine(sm, folder)  # concurrency=1 by default in helper
+        return sm, eng, f"{base}/big.gz"
+
+    def _seed_progress(self, eng, sm):
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+
+    def test_large_file_downloads_in_parallel_segments(self, tmp_download_folder, monkeypatch):
+        # Shrink thresholds so a small payload exercises the parallel path.
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        payload = bytes((i % 256) for i in range(1000))  # 1000 bytes -> ~16 segments
+
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        eng._concurrency = 4  # allow parallelism
+        eng._conn_budget = __import__("threading").BoundedSemaphore(4)
+        self._seed_progress(eng, sm)
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload  # reassembled byte-identical
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+        # Multiple distinct range starts were requested (i.e. it really split).
+        starts = client.range_starts.get(url, [])
+        # First entry is the 1-byte range-support probe (start 0); the rest are
+        # the real segments. Expect more than one distinct segment start.
+        assert len(set(starts)) > 2
+
+    def test_falls_back_to_single_stream_when_no_range_support(
+        self, tmp_download_folder, monkeypatch
+    ):
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        payload = b"N" * 1000
+
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        eng._concurrency = 4
+        eng._conn_budget = __import__("threading").BoundedSemaphore(4)
+        self._seed_progress(eng, sm)
+
+        # Backend does NOT support ranges -> probe returns 200 -> single stream.
+        client = _FakeClient({url: payload}, supports_range=False)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+
+    def test_small_file_stays_single_stream(self, tmp_download_folder, monkeypatch):
+        # With the real 64MB threshold, a small file must not use ranges at all.
+        payload = b"small-file-contents"
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        eng._concurrency = 8
+        eng._conn_budget = __import__("threading").BoundedSemaphore(8)
+        self._seed_progress(eng, sm)
+
+        client = _FakeClient({url: payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload
+        # No ranged requests were made (no probe, no segments): fully single-stream.
+        assert client.range_starts.get(url, []) == []
+
+    def test_connection_budget_is_respected(self, tmp_download_folder, monkeypatch):
+        """Concurrent segments must never exceed the connection budget."""
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        payload = bytes((i % 256) for i in range(2000))
+
+        sm, eng, url = self._big_file_order(tmp_download_folder, payload)
+        budget = 3
+        eng._concurrency = budget
+        eng._conn_budget = __import__("threading").BoundedSemaphore(budget)
+        self._seed_progress(eng, sm)
+
+        # Instrument the fake to track peak concurrent in-flight streams.
+        import threading
+        state = {"cur": 0, "peak": 0}
+        lock = threading.Lock()
+        base_client = _FakeClient({url: payload}, supports_range=True)
+        real_stream = base_client.stream
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def counting_stream(method, u, headers=None):
+            with lock:
+                state["cur"] += 1
+                state["peak"] = max(state["peak"], state["cur"])
+            try:
+                with real_stream(method, u, headers=headers) as resp:
+                    yield resp
+            finally:
+                with lock:
+                    state["cur"] -= 1
+
+        base_client.stream = counting_stream
+        eng._download_file(base_client, sm.manifest.files[0])
+
+        assert state["peak"] <= budget
+        assert eng._get_filepath(sm.manifest.files[0]).read_bytes() == payload
+
+
+# --- Inline hashing during streaming (recommendation D) ---
+
+class TestInlineHashing:
+    def _md5_order(self, folder, payload, digest):
+        base = "https://ex.invalid/RawData"
+        md5sums = f"{digest}  a.gz\n".encode()
+        files = [
+            OrderFile(filename="MD5SUMS", filesizeinbyte=len(md5sums), filetype="RawData",
+                      fileurl=f"{base}/MD5SUMS", modifieddatetime="2026-01-01"),
+            OrderFile(filename="a.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/a.gz", modifieddatetime="2026-01-01"),
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        return sm, base, md5sums
+
+    def _seed_progress(self, eng, sm):
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+
+    def test_single_stream_reuses_inline_digest_no_reread(self, tmp_download_folder, monkeypatch):
+        payload = b"inline-hash-me" * 10
+        digest = hashlib.md5(payload).hexdigest()
+        sm, base, md5sums = self._md5_order(tmp_download_folder, payload, digest)
+
+        # Fail loudly if the file is re-read for hashing after download.
+        import dart_downloader.validation.providers as prov
+        calls = {"n": 0}
+        real = prov.compute_md5
+        monkeypatch.setattr(prov, "compute_md5",
+                            lambda p: (calls.__setitem__("n", calls["n"] + 1), real(p))[1])
+
+        eng = _make_engine(sm, tmp_download_folder)
+        self._seed_progress(eng, sm)
+        client = _FakeClient({f"{base}/MD5SUMS": md5sums, f"{base}/a.gz": payload},
+                             supports_range=True)
+        remaining = eng._prepare_md5sums(client, sm.get_pending_files())
+        for f in remaining:
+            eng._download_file(client, f)
+
+        a = next(f for f in sm.manifest.files if f.filename == "a.gz")
+        assert a.md5_status == Md5Status.VERIFIED
+        # compute_md5 was NOT called for a.gz — the inline digest was reused.
+        assert calls["n"] == 0
+
+    def test_inline_digest_still_catches_mismatch(self, tmp_download_folder, monkeypatch):
+        monkeypatch.setattr("dart_downloader.download.engine.time.sleep", lambda *_: None)
+        payload = b"actual-bytes"
+        wrong_digest = "0" * 32  # MD5SUMS claims a digest the content won't match
+        sm, base, md5sums = self._md5_order(tmp_download_folder, payload, wrong_digest)
+
+        eng = _make_engine(sm, tmp_download_folder)
+        self._seed_progress(eng, sm)
+        client = _FakeClient({f"{base}/MD5SUMS": md5sums, f"{base}/a.gz": payload},
+                             supports_range=True)
+        remaining = eng._prepare_md5sums(client, sm.get_pending_files())
+        for f in remaining:
+            eng._download_file(client, f)
+
+        a = next(f for f in sm.manifest.files if f.filename == "a.gz")
+        # Inline digest must still detect the mismatch and fail the file.
+        assert a.md5_status == Md5Status.MISMATCH
+        assert a.status == FileStatus.FAILED
+
+    def test_provider_accepts_precomputed_digest(self, tmp_download_folder):
+        # Unit-level: passing actual_md5 skips the file read entirely.
+        from dart_downloader.validation.providers import Md5ValidationProvider
+        p = tmp_download_folder / "x.gz"
+        p.write_bytes(b"whatever")
+        good = hashlib.md5(b"whatever").hexdigest()
+        # Provide a matching precomputed digest; file content is irrelevant here.
+        res = Md5ValidationProvider().validate(p, 8, expected_md5=good, actual_md5=good)
+        assert res.valid
+        # A wrong precomputed digest fails even though the file itself is fine.
+        res2 = Md5ValidationProvider().validate(p, 8, expected_md5=good, actual_md5="f" * 32)
+        assert not res2.valid
+
+
+# --- Progress UI: per-file status/rate/ETA selection (recommendation E) ---
+
+from dart_downloader.models.models import DownloadProgress
+
+
+class TestProgressSelection:
+    def _p(self, name, done, total, completed=False, failed=False):
+        return DownloadProgress(filename=name, bytes_downloaded=done,
+                                total_bytes=total, completed=completed, failed=failed)
+
+    def test_only_inflight_files_are_shown(self):
+        from dart_downloader.ui.terminal import _select_active_files
+        ps = [
+            self._p("started.gz", 50, 100),                    # in-flight -> show
+            self._p("notstarted.gz", 0, 100),                  # not started -> hide
+            self._p("done.gz", 100, 100, completed=True),      # completed -> hide
+            self._p("bad.gz", 30, 100, failed=True),           # failed -> hide
+        ]
+        active = _select_active_files(ps)
+        assert [p.filename for p in active] == ["started.gz"]
+
+    def test_ordered_by_bytes_and_capped(self):
+        from dart_downloader.ui.terminal import _select_active_files
+        ps = [self._p(f"f{i}.gz", done=i * 10, total=1000) for i in range(1, 12)]
+        active = _select_active_files(ps, limit=3)
+        # Most-active first, capped to the limit.
+        assert [p.filename for p in active] == ["f11.gz", "f10.gz", "f9.gz"]
+
+    def test_run_with_progress_smoke(self, monkeypatch):
+        """run_with_progress drives to completion against a fake engine that
+        reports progress, without raising and cleaning up per-file rows."""
+        from dart_downloader.ui import terminal as ui
+
+        class _FakeEngine:
+            def __init__(self):
+                self.progress = {
+                    "a.gz": DownloadProgress(filename="a.gz", bytes_downloaded=0, total_bytes=100),
+                    "b.gz": DownloadProgress(filename="b.gz", bytes_downloaded=0, total_bytes=100),
+                }
+
+            def run(self):
+                # Simulate some transfer then completion.
+                self.progress["a.gz"].bytes_downloaded = 100
+                self.progress["a.gz"].completed = True
+                self.progress["b.gz"].bytes_downloaded = 100
+                self.progress["b.gz"].completed = True
+
+        # Speed up the updater loop.
+        monkeypatch.setattr(ui.time, "sleep", lambda *_: None)
+        ui.run_with_progress(_FakeEngine(), total_files=2, total_bytes=200)
+
+
+# --- Local-server (incloud == 0) concurrency cap ---
+
+class _ConcurrencyProbeClient:
+    """Fake client that records how many streams are open at once.
+
+    Each ``stream`` call bumps a live counter (tracking the peak), holds briefly
+    so overlapping downloads actually coexist, then serves the whole body. Lets
+    a test assert the *peak* number of concurrent downloads.
+    """
+
+    def __init__(self, contents):
+        self._contents = contents
+        self._live = 0
+        self.peak = 0
+        self._lock = __import__("threading").Lock()
+
+    @contextmanager
+    def stream(self, method, url, headers=None):
+        import time as _t
+        with self._lock:
+            self._live += 1
+            self.peak = max(self.peak, self._live)
+        try:
+            _t.sleep(0.05)  # hold the slot so concurrent downloads overlap
+            yield _FakeResponse(self._contents[url], status_code=200)
+        finally:
+            with self._lock:
+                self._live -= 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestIncloudLocalCap:
+    def _run(self, folder, incloud_value, concurrency, n_files=10):
+        base = "https://ex.invalid/RawData"
+        payload = b"x" * 200
+        files = [
+            OrderFile(
+                filename=f"f{i}.gz", filesizeinbyte=len(payload), filetype="RawData",
+                fileurl=f"{base}/f{i}.gz", modifieddatetime="2026-01-01",
+                incloud=incloud_value,
+            )
+            for i in range(n_files)
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = DownloadEngine(
+            share_token="tok", download_folder=folder,
+            state_manager=sm, concurrency=concurrency,
+        )
+        client = _ConcurrencyProbeClient(
+            {f"{base}/f{i}.gz": payload for i in range(n_files)}
+        )
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            list(ex.map(lambda f: eng._download_file(client, f), sm.get_pending_files()))
+        return sm, client
+
+    def test_incloud0_files_capped_at_four(self, tmp_download_folder):
+        # 10 local-server files, generous concurrency: never more than 4 at once.
+        sm, client = self._run(tmp_download_folder, incloud_value=0, concurrency=8)
+        assert client.peak <= engine_mod.INCLOUD_LOCAL_MAX_CONCURRENCY
+        assert all(f.status == FileStatus.COMPLETED for f in sm.manifest.files)
+
+    def test_incloud1_files_not_throttled(self, tmp_download_folder):
+        # Cloud files should use the full concurrency (peak > the local cap).
+        sm, client = self._run(tmp_download_folder, incloud_value=1, concurrency=8)
+        assert client.peak > engine_mod.INCLOUD_LOCAL_MAX_CONCURRENCY
+        assert all(f.status == FileStatus.COMPLETED for f in sm.manifest.files)
+
+    def test_cap_never_exceeds_concurrency(self, tmp_download_folder):
+        # With --concurrency 2, the effective local cap is min(4, 2) = 2.
+        sm, client = self._run(tmp_download_folder, incloud_value=0, concurrency=2)
+        assert client.peak <= 2
+        assert all(f.status == FileStatus.COMPLETED for f in sm.manifest.files)
+
+    def test_incloud0_large_file_uses_single_stream(self, tmp_download_folder, monkeypatch):
+        # A large incloud:0 file must NOT be split into ranged segments.
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        base = "https://ex.invalid/RawData"
+        payload = b"y" * 1000
+        files = [
+            OrderFile(filename="big.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/big.gz", modifieddatetime="2026-01-01", incloud=0),
+        ]
+        sm = StateManager(tmp_download_folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = DownloadEngine(
+            share_token="tok", download_folder=tmp_download_folder,
+            state_manager=sm, concurrency=8,
+        )
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+        client = _FakeClient({f"{base}/big.gz": payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+        # Single-stream => no ranged (segment) requests were issued at all.
+        assert client.range_starts.get(f"{base}/big.gz", []) == []

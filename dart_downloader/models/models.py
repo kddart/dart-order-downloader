@@ -13,6 +13,11 @@ class OrderFile(BaseModel):
     filetype: str
     fileurl: str
     modifieddatetime: str
+    # 1 = file is in cloud storage (Wasabi) and can be downloaded aggressively;
+    # 0 = file is on a local DArT server with a limited connection, so downloads
+    # of these files are capped (see engine's INCLOUD_LOCAL cap). Defaults to 1
+    # (cloud) when the API omits the field, so older responses aren't throttled.
+    incloud: int = 1
 
 
 class OrderData(BaseModel):
@@ -47,6 +52,10 @@ class FileState(BaseModel):
     fileurl: str
     filetype: str
     expected_size: int
+    # Carried through from OrderFile.incloud (see there). Persisted so resume
+    # applies the same throttling. Defaults to 1 for manifests written before
+    # this field existed.
+    incloud: int = 1
     actual_size: int | None = None
     status: FileStatus = FileStatus.PENDING
     validated: bool = False
