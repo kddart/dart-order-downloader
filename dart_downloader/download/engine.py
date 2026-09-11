@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import time
@@ -36,6 +37,13 @@ BACKOFF_BASE = 2.0
 PARALLEL_MIN_FILE_SIZE = 64 * 1024 * 1024  # 64 MB
 PARALLEL_SEGMENT_SIZE = 16 * 1024 * 1024   # 16 MB per range segment
 
+# Files with incloud == 0 are served from a local DArT server on a limited
+# internet connection (not Wasabi). To avoid saturating that link, downloads of
+# these files are hard-capped to this many at once, independent of and stricter
+# than --concurrency. incloud == 1 files (in cloud storage) are unaffected.
+INCLOUD_LOCAL = 0
+INCLOUD_LOCAL_MAX_CONCURRENCY = 4
+
 
 class _RangeUnsupported(Exception):
     """Raised mid-download when a backend stops honouring range requests, so the
@@ -68,6 +76,13 @@ class DownloadEngine:
         # slot here, so the total number of concurrent HTTP connections never
         # exceeds `concurrency` regardless of how work is split into segments.
         self._conn_budget = BoundedSemaphore(max(1, concurrency))
+        # Dedicated, stricter cap for files served from the limited local DArT
+        # server (incloud == 0). Held for the whole duration of each such file's
+        # download, so no more than INCLOUD_LOCAL_MAX_CONCURRENCY of them run at
+        # once regardless of --concurrency. Never larger than the global budget.
+        self._local_budget = BoundedSemaphore(
+            max(1, min(INCLOUD_LOCAL_MAX_CONCURRENCY, concurrency))
+        )
 
     @property
     def progress(self) -> dict[str, DownloadProgress]:
@@ -259,6 +274,23 @@ class DownloadEngine:
         return remaining
 
     def _download_file(self, client: httpx.Client, file_state: FileState):
+        """Download one file, throttling local-server (incloud == 0) files.
+
+        Files served from the limited local DArT server hold a slot in the
+        stricter ``_local_budget`` semaphore for the whole download, so no more
+        than ``INCLOUD_LOCAL_MAX_CONCURRENCY`` of them transfer at once. Cloud
+        files (incloud == 1) acquire nothing extra and are unthrottled beyond
+        the global connection budget.
+        """
+        limiter = (
+            self._local_budget
+            if file_state.incloud == INCLOUD_LOCAL
+            else contextlib.nullcontext()
+        )
+        with limiter:
+            self._download_file_inner(client, file_state)
+
+    def _download_file_inner(self, client: httpx.Client, file_state: FileState):
         filepath = self._get_filepath(file_state)
 
         md5_attempts = 0  # number of re-downloads triggered by MD5 mismatch
@@ -392,8 +424,14 @@ class DownloadEngine:
         url = file_state.fileurl
         filename = file_state.filename
 
+        # Local-server files (incloud == 0) are on a limited link and are already
+        # throttled to a small number of concurrent files; keep each to a single
+        # connection (no ranged segmentation) so we don't multiply connections
+        # against that constrained server. Ranged parallelism only benefits
+        # lossy links, which is a cloud-storage concern.
         use_parallel = (
-            self._concurrency > 1
+            file_state.incloud != INCLOUD_LOCAL
+            and self._concurrency > 1
             and expected >= PARALLEL_MIN_FILE_SIZE
             and self._supports_range(client, url)
         )

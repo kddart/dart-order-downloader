@@ -74,6 +74,7 @@ class StateManager:
                     fileurl=f.fileurl,
                     filetype=f.filetype,
                     expected_size=f.filesizeinbyte,
+                    incloud=f.incloud,
                 )
             )
 

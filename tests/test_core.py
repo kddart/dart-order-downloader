@@ -1431,3 +1431,120 @@ class TestProgressSelection:
         # Speed up the updater loop.
         monkeypatch.setattr(ui.time, "sleep", lambda *_: None)
         ui.run_with_progress(_FakeEngine(), total_files=2, total_bytes=200)
+
+
+# --- Local-server (incloud == 0) concurrency cap ---
+
+class _ConcurrencyProbeClient:
+    """Fake client that records how many streams are open at once.
+
+    Each ``stream`` call bumps a live counter (tracking the peak), holds briefly
+    so overlapping downloads actually coexist, then serves the whole body. Lets
+    a test assert the *peak* number of concurrent downloads.
+    """
+
+    def __init__(self, contents):
+        self._contents = contents
+        self._live = 0
+        self.peak = 0
+        self._lock = __import__("threading").Lock()
+
+    @contextmanager
+    def stream(self, method, url, headers=None):
+        import time as _t
+        with self._lock:
+            self._live += 1
+            self.peak = max(self.peak, self._live)
+        try:
+            _t.sleep(0.05)  # hold the slot so concurrent downloads overlap
+            yield _FakeResponse(self._contents[url], status_code=200)
+        finally:
+            with self._lock:
+                self._live -= 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestIncloudLocalCap:
+    def _run(self, folder, incloud_value, concurrency, n_files=10):
+        base = "https://ex.invalid/RawData"
+        payload = b"x" * 200
+        files = [
+            OrderFile(
+                filename=f"f{i}.gz", filesizeinbyte=len(payload), filetype="RawData",
+                fileurl=f"{base}/f{i}.gz", modifieddatetime="2026-01-01",
+                incloud=incloud_value,
+            )
+            for i in range(n_files)
+        ]
+        sm = StateManager(folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = DownloadEngine(
+            share_token="tok", download_folder=folder,
+            state_manager=sm, concurrency=concurrency,
+        )
+        client = _ConcurrencyProbeClient(
+            {f"{base}/f{i}.gz": payload for i in range(n_files)}
+        )
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            list(ex.map(lambda f: eng._download_file(client, f), sm.get_pending_files()))
+        return sm, client
+
+    def test_incloud0_files_capped_at_four(self, tmp_download_folder):
+        # 10 local-server files, generous concurrency: never more than 4 at once.
+        sm, client = self._run(tmp_download_folder, incloud_value=0, concurrency=8)
+        assert client.peak <= engine_mod.INCLOUD_LOCAL_MAX_CONCURRENCY
+        assert all(f.status == FileStatus.COMPLETED for f in sm.manifest.files)
+
+    def test_incloud1_files_not_throttled(self, tmp_download_folder):
+        # Cloud files should use the full concurrency (peak > the local cap).
+        sm, client = self._run(tmp_download_folder, incloud_value=1, concurrency=8)
+        assert client.peak > engine_mod.INCLOUD_LOCAL_MAX_CONCURRENCY
+        assert all(f.status == FileStatus.COMPLETED for f in sm.manifest.files)
+
+    def test_cap_never_exceeds_concurrency(self, tmp_download_folder):
+        # With --concurrency 2, the effective local cap is min(4, 2) = 2.
+        sm, client = self._run(tmp_download_folder, incloud_value=0, concurrency=2)
+        assert client.peak <= 2
+        assert all(f.status == FileStatus.COMPLETED for f in sm.manifest.files)
+
+    def test_incloud0_large_file_uses_single_stream(self, tmp_download_folder, monkeypatch):
+        # A large incloud:0 file must NOT be split into ranged segments.
+        monkeypatch.setattr(engine_mod, "PARALLEL_MIN_FILE_SIZE", 100)
+        monkeypatch.setattr(engine_mod, "PARALLEL_SEGMENT_SIZE", 64)
+        base = "https://ex.invalid/RawData"
+        payload = b"y" * 1000
+        files = [
+            OrderFile(filename="big.gz", filesizeinbyte=len(payload), filetype="RawData",
+                      fileurl=f"{base}/big.gz", modifieddatetime="2026-01-01", incloud=0),
+        ]
+        sm = StateManager(tmp_download_folder, "X")
+        sm.load_or_create(_order_with(files))
+        eng = DownloadEngine(
+            share_token="tok", download_folder=tmp_download_folder,
+            state_manager=sm, concurrency=8,
+        )
+        from dart_downloader.models.models import DownloadProgress
+        for f in sm.get_pending_files():
+            eng._progress[f.filename] = DownloadProgress(
+                filename=f.filename, total_bytes=f.expected_size
+            )
+        client = _FakeClient({f"{base}/big.gz": payload}, supports_range=True)
+        eng._download_file(client, sm.manifest.files[0])
+
+        fp = eng._get_filepath(sm.manifest.files[0])
+        assert fp.read_bytes() == payload
+        assert sm.manifest.files[0].status == FileStatus.COMPLETED
+        # Single-stream => no ranged (segment) requests were issued at all.
+        assert client.range_starts.get(f"{base}/big.gz", []) == []
